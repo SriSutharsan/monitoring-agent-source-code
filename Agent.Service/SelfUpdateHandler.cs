@@ -62,7 +62,9 @@ public sealed class SelfUpdateHandler : IUpdateHandler
 
             Uri uri;
             if (!Uri.TryCreate(m.PackageUrl, UriKind.Absolute, out uri) || uri.Scheme != Uri.UriSchemeHttps) { _log.LogWarning("Update package URL must be https"); return; }
-            if (_state.Get("update.failed_version") == m.Version) return;     // do not loop on a package that already failed once
+            // do not loop on a package that already failed once (update.ps1 writes the marker after a rollback)
+            if (_state.Get("update.failed_version") == m.Version
+                || File.Exists(Path.Combine(_paths.UpdateDirectory, "failed-" + SafeName(m.Version) + ".txt"))) return;
 
             var script = Path.Combine(AppContext.BaseDirectory, "update.ps1");
             if (!File.Exists(script)) { _log.LogWarning("update.ps1 not found next to the service; automatic update unavailable"); return; }
