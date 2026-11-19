@@ -33,6 +33,8 @@ public class RegistrationInventory
     public HardwareInventory Hardware { get; set; }
     public StorageInventory Storage { get; set; }
     public NetworkInfo Network { get; set; }
+    public SoftwareInventory Software { get; set; }
+    public PerformanceMetrics Performance { get; set; }
 }
 
 public class RegistrationResponse
