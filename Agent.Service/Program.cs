@@ -20,6 +20,7 @@ using Agent.Core;
 using Agent.Logging;
 using Agent.Models;
 using Agent.Storage;
+using Serilog;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
