@@ -1,0 +1,1906 @@
+openapi: 3.0.3
+
+info:
+  title: Endpoint Monitoring Agent API
+  version: "1.0"
+  description: |
+    REST API consumed by the Windows Endpoint Monitoring Agent.
+
+    ### Authentication
+    - `POST /devices/register` and `GET /ping` are **unauthenticated**.
+    - All other endpoints require `Authorization: Bearer <DeviceCredential.Secret>`.
+
+    ### Serialisation
+    - All bodies are `application/json`, UTF-8, camelCase keys, nulls omitted.
+    - All timestamps are ISO 8601 UTC strings, e.g. `"2026-11-19T04:37:02Z"`.
+
+    ### Idempotency
+    Every `POST /devices/{deviceId}/{module}` call carries an `Idempotency-Key` header.
+    Re-sending the same key is safe — the server deduplicates on that key.
+
+servers:
+  - url: https://monitor.example.com/api/v1
+    description: Production
+
+  - url: http://localhost:5100/api/v1
+    description: Local mock server (AllowInsecureLoopback must be true)
+
+# ---------------------------------------------------------------------------
+# Security scheme
+# ---------------------------------------------------------------------------
+security: []   # overridden per-operation
+
+components:
+  securitySchemes:
+    DeviceBearer:
+      type: http
+      scheme: bearer
+      description: >
+        Device-specific secret issued in `RegistrationResponse.credential.secret`.
+        Stored encrypted with Windows DPAPI and loaded at runtime.
+
+  # -------------------------------------------------------------------------
+  # Reusable parameters
+  # -------------------------------------------------------------------------
+  parameters:
+    deviceId:
+      name: deviceId
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Stable device UUID assigned at first registration.
+      example: "b3d2f1a0-cafe-4321-babe-000000000001"
+
+    module:
+      name: module
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/ModuleName'
+      description: Collector module that produced the batch.
+
+    idempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+        maxLength: 64
+      description: >
+        SHA-256-based hash of all record idempotency keys in this batch, truncated to 32 chars.
+        The server uses this to deduplicate retried requests.
+      example: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"
+
+  # -------------------------------------------------------------------------
+  # Reusable responses
+  # -------------------------------------------------------------------------
+  responses:
+    Unauthorized:
+      description: Missing or invalid device credential.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+
+    Forbidden:
+      description: Device is revoked or blocked.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+
+    RateLimited:
+      description: Request rate limit exceeded. Respect the `Retry-After` header.
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+          description: Seconds to wait before retrying.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+
+    ServerError:
+      description: Transient server error. The agent will retry with exponential back-off.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+
+  # -------------------------------------------------------------------------
+  # Schemas
+  # -------------------------------------------------------------------------
+  schemas:
+
+    # -- enumerations --------------------------------------------------------
+
+    ModuleName:
+      type: string
+      enum:
+        - heartbeat
+        - device
+        - hardware
+        - storage
+        - network
+        - performance
+        - software
+        - security
+        - events
+        - health
+        - diagnostics
+        - alerts
+        - changes
+      description: >
+        Module (endpoint segment) that maps one or more collector categories:
+        `hardware` carries both `hardware` and `hardware.peripherals`;
+        `network` carries `network.config` and `network.wifi`;
+        `performance` carries `perf.cpu_memory`, `perf.disk`, `perf.network`, and `battery`.
+
+    RegistrationStatus:
+      type: string
+      enum: [pending, approved, rejected]
+
+    Severity:
+      type: string
+      enum: [info, warning, critical]
+
+    # -- shared primitives ---------------------------------------------------
+
+    ApiError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              example: INVALID_FIELD
+            message:
+              type: string
+              example: "records[2].payload.cpuPercent must be 0–100"
+            requestId:
+              type: string
+              description: Server-side correlation ID for log tracing.
+              example: "req_01JFXYZ"
+            details:
+              type: array
+              items:
+                type: object
+                required: [field, issue]
+                properties:
+                  field:
+                    type: string
+                    example: "records[2].payload.cpuPercent"
+                  issue:
+                    type: string
+                    example: "must be between 0 and 100"
+
+    SignedEnvelope:
+      type: object
+      required: [payload, signature, keyId]
+      description: >
+        A tamper-evident signed document.
+        `payload` = base64(UTF-8 JSON).
+        `signature` = base64(RSA-SHA256 PKCS#1 v1.5 over the raw payload bytes).
+        The agent verifies both before applying the content.
+      properties:
+        payload:
+          type: string
+          format: byte
+          description: base64-encoded UTF-8 JSON of the inner document.
+        signature:
+          type: string
+          format: byte
+          description: base64-encoded RSA-SHA256 PKCS#1 v1.5 signature over the decoded payload bytes.
+        keyId:
+          type: string
+          description: Key rotation hint; identifies the signing key pair.
+          example: "config-key-2026"
+
+    DeviceCredential:
+      type: object
+      required: [secret]
+      properties:
+        secret:
+          type: string
+          description: Bearer token used for all subsequent authenticated requests.
+        keyId:
+          type: string
+          description: Key rotation hint attached to every authenticated request as `X-Key-Id`.
+        expiresUtc:
+          type: string
+          format: date-time
+          description: Optional credential expiry. Null means no server-enforced expiry.
+
+    # -- registration --------------------------------------------------------
+
+    DeviceFingerprint:
+      type: object
+      properties:
+        systemUuid:
+          type: string
+          description: DMI/SMBIOS UUID from Win32_ComputerSystemProduct.
+          example: "4c4c4544-0059-5410-8052-b8c04f575931"
+        serialNumber:
+          type: string
+          example: "ABC1234"
+        manufacturer:
+          type: string
+          example: "Dell Inc."
+        model:
+          type: string
+          example: "Latitude 5540"
+        macAddresses:
+          type: array
+          items:
+            type: string
+          description: Physical MAC addresses of all non-virtual adapters.
+          example: ["aa:bb:cc:dd:ee:ff"]
+
+    RegistrationInventory:
+      type: object
+      description: >
+        Included only on the **first** registration POST. Omitted on subsequent approval-poll calls.
+      properties:
+        device:
+          $ref: '#/components/schemas/DeviceInfo'
+        hardware:
+          $ref: '#/components/schemas/HardwareInventory'
+        storage:
+          $ref: '#/components/schemas/StorageInventory'
+        network:
+          $ref: '#/components/schemas/NetworkInfo'
+
+    RegistrationRequest:
+      type: object
+      required: [schemaVersion, deviceId, registrationToken, agentVersion, hostname, requestedUtc, fingerprint]
+      properties:
+        schemaVersion:
+          type: string
+          enum: ["1.0"]
+          description: Always `"1.0"`.
+        deviceId:
+          type: string
+          description: >
+            Stable UUID generated on first run and persisted in the SQLite state store.
+            Regenerated when an image clone is detected (fingerprint mismatch).
+          example: "b3d2f1a0-cafe-4321-babe-000000000001"
+        registrationToken:
+          type: string
+          description: Shared secret configured by the installer (`Agent:Registration:Token`).
+        agentVersion:
+          type: string
+          example: "1.2.3"
+        hostname:
+          type: string
+          example: "DESKTOP-ABC123"
+        requestedUtc:
+          type: string
+          format: date-time
+          description: Agent clock at the moment the request is built.
+        metadata:
+          type: object
+          additionalProperties:
+            type: string
+          description: >
+            Arbitrary string key/value tags set by the installer.
+            The `"group"` key is added automatically when `Agent:Registration:Group` is configured.
+          example:
+            group: "engineering"
+            site: "london"
+        fingerprint:
+          $ref: '#/components/schemas/DeviceFingerprint'
+        inventory:
+          $ref: '#/components/schemas/RegistrationInventory'
+
+    RegistrationResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          $ref: '#/components/schemas/RegistrationStatus'
+        deviceId:
+          type: string
+          description: Echoed back; matches the request `deviceId`.
+        credential:
+          $ref: '#/components/schemas/DeviceCredential'
+          description: Present **only** when `status` is `"approved"`.
+        pollAfterSeconds:
+          type: integer
+          description: Advisory delay before the next poll. Agent clamps to 10–3600 s.
+          example: 60
+        message:
+          type: string
+          description: Human-readable note. Present when `status` is `"rejected"`.
+        serverTimeUtc:
+          type: string
+          format: date-time
+          description: Server wall clock; used to track clock skew.
+
+    # -- ingest --------------------------------------------------------------
+
+    IngestRecord:
+      type: object
+      required: [id, category, collectedAtUtc, payload]
+      properties:
+        id:
+          type: string
+          description: Per-record idempotency key (SHA-256-based, max 64 chars).
+          example: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+        category:
+          type: string
+          description: >
+            Collector category: `heartbeat`, `device`, `hardware`, `hardware.peripherals`,
+            `storage`, `network.config`, `network.wifi`, `perf.cpu_memory`, `perf.disk`,
+            `perf.network`, `battery`, `software`, `security`, `events`, `health`,
+            `diagnostics`, `alerts`, `changes`.
+          example: "perf.cpu_memory"
+        collectedAtUtc:
+          type: string
+          format: date-time
+          description: Timestamp when the collector produced this record.
+        payload:
+          description: >
+            Module-specific JSON object. The exact schema depends on the `module` path parameter.
+            See the **Payload Schemas** section for each module's shape.
+          oneOf:
+            - $ref: '#/components/schemas/Heartbeat'
+            - $ref: '#/components/schemas/DeviceInfo'
+            - $ref: '#/components/schemas/HardwareInventory'
+            - $ref: '#/components/schemas/StorageInventory'
+            - $ref: '#/components/schemas/NetworkInfo'
+            - $ref: '#/components/schemas/PerformanceMetrics'
+            - $ref: '#/components/schemas/SoftwareInventory'
+            - $ref: '#/components/schemas/SecurityStatus'
+            - $ref: '#/components/schemas/WindowsEventBatch'
+            - $ref: '#/components/schemas/DeviceHealth'
+            - $ref: '#/components/schemas/DiagnosticReport'
+            - $ref: '#/components/schemas/AlertRecord'
+            - $ref: '#/components/schemas/ChangeRecord'
+
+    IngestBatch:
+      type: object
+      required: [schemaVersion, deviceId, module, sentUtc, records]
+      properties:
+        schemaVersion:
+          type: string
+          enum: ["1.0"]
+        deviceId:
+          type: string
+          example: "b3d2f1a0-cafe-4321-babe-000000000001"
+        module:
+          $ref: '#/components/schemas/ModuleName'
+        sentUtc:
+          type: string
+          format: date-time
+          description: Agent clock when the batch was dispatched.
+        records:
+          type: array
+          minItems: 1
+          maxItems: 500
+          items:
+            $ref: '#/components/schemas/IngestRecord'
+
+    RejectedRecord:
+      type: object
+      required: [id, code, message]
+      properties:
+        id:
+          type: string
+          description: Idempotency key of the rejected record.
+        code:
+          type: string
+          example: "SCHEMA_ERROR"
+        message:
+          type: string
+          example: "unknown field 'foo'"
+        retryable:
+          type: boolean
+          description: >
+            `true` → agent re-queues for retry after 60 s.
+            `false` → agent moves to dead-letter queue; never retried.
+
+    UpdateOffer:
+      type: object
+      properties:
+        manifest:
+          $ref: '#/components/schemas/SignedEnvelope'
+          description: >
+            Signed envelope whose decoded payload is an `UpdateManifest` object.
+            Null when no update is available.
+
+    IngestResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          example: "ok"
+        accepted:
+          type: array
+          items:
+            type: string
+          description: Idempotency keys of accepted records. Records not listed in `rejected` are implicitly accepted.
+        rejected:
+          type: array
+          items:
+            $ref: '#/components/schemas/RejectedRecord'
+        serverTimeUtc:
+          type: string
+          format: date-time
+        configVersion:
+          type: integer
+          format: int64
+          description: >
+            Current server config version. When higher than the agent's local version,
+            the agent immediately calls `GET /devices/{deviceId}/config`.
+          example: 42
+        nextSyncSeconds:
+          type: integer
+          description: Advisory next-sync interval. Agent may ignore.
+          example: 15
+        update:
+          $ref: '#/components/schemas/UpdateOffer'
+
+    # -- remote config -------------------------------------------------------
+
+    ThresholdConfig:
+      type: object
+      properties:
+        storageWarningPercent:   { type: number, format: double, default: 80 }
+        storageCriticalPercent:  { type: number, format: double, default: 90 }
+        criticalFreeBytes:       { type: integer, format: int64, default: 2147483648 }
+        criticalFreePercent:     { type: number, format: double, default: 5 }
+        cpuPercent:              { type: number, format: double, default: 90 }
+        ramPercent:              { type: number, format: double, default: 90 }
+        sustainedSamples:        { type: integer, default: 3 }
+        diskBusyPercent:         { type: number, format: double, default: 95 }
+        diskQueueLength:         { type: number, format: double, default: 8 }
+        processCpuPercent:       { type: number, format: double, default: 80 }
+        processSustainedSamples: { type: integer, default: 10 }
+        latencyMs:               { type: number, format: double, default: 300 }
+        packetLossPercent:       { type: number, format: double, default: 10 }
+        networkFlapCount:        { type: integer, default: 3 }
+        networkFlapWindowMinutes: { type: integer, default: 15 }
+        batteryLowPercent:       { type: integer, default: 15 }
+        batteryHealthLowPercent: { type: integer, default: 50 }
+        signatureMaxAgeDays:     { type: integer, default: 7 }
+        failedLogonCount:        { type: integer, default: 5 }
+        failedLogonWindowMinutes: { type: integer, default: 10 }
+        diskTemperatureC:        { type: number, format: double, default: 65 }
+        systemTemperatureC:      { type: number, format: double, default: 90 }
+        pendingRestartDays:      { type: integer, default: 7 }
+        recurringProblemCount:   { type: integer, default: 5 }
+        recurringProblemWindowHours: { type: integer, default: 24 }
+
+    RetentionConfig:
+      type: object
+      properties:
+        syncedRetentionDays:  { type: integer, default: 7 }
+        pendingMaxAgeDays:    { type: integer, default: 30 }
+        maxPendingRecords:    { type: integer, default: 200000 }
+        healthHistoryDays:    { type: integer, default: 30 }
+        changeHistoryDays:    { type: integer, default: 365 }
+
+    SoftwarePolicy:
+      type: object
+      properties:
+        blockedApplications:
+          type: array
+          items: { type: string }
+          description: Wildcard patterns (`*` and `?`) matched against application name. Any match = unauthorized.
+          example: ["TeamViewer*", "uTorrent*"]
+        allowedApplications:
+          type: array
+          items: { type: string }
+          description: When non-empty, applications NOT matching any pattern are flagged (allow-list mode).
+        minimumVersions:
+          type: array
+          items:
+            type: object
+            required: [namePattern, minimumVersion]
+            properties:
+              namePattern:      { type: string, example: "Google Chrome*" }
+              minimumVersion:   { type: string, example: "120.0" }
+        potentiallyUnwantedPatterns:
+          type: array
+          items: { type: string }
+          example: ["*crack*", "*keygen*"]
+        allowListIgnoresMicrosoftComponents:
+          type: boolean
+          default: true
+
+    EventConfig:
+      type: object
+      properties:
+        firstRunLookbackMinutes: { type: integer, default: 360 }
+        maxEventsPerCycle:       { type: integer, default: 500 }
+        maxMessageLength:        { type: integer, default: 1000 }
+        collectSuccessfulLogons: { type: boolean, default: true }
+
+    NetworkProbeConfig:
+      type: object
+      properties:
+        pingTargets:
+          type: array
+          items: { type: string }
+          example: ["8.8.8.8", "1.1.1.1"]
+        pingTimeoutMs: { type: integer, default: 1500 }
+        pingGateway:   { type: boolean, default: true }
+
+    DiagnosticRequest:
+      type: object
+      properties:
+        requestId:
+          type: string
+          description: Unique ID; the agent echoes this in the diagnostic report payload.
+          example: "diag-2026-11-19-001"
+        expiresUtc:
+          type: string
+          format: date-time
+          description: Agent ignores the request after this time.
+        sections:
+          type: array
+          items:
+            type: string
+            enum: [services, problem_devices, startup_items, recent_errors]
+          description: Which sections to include in the diagnostic report.
+
+    AgentConfigDocument:
+      type: object
+      required: [version]
+      description: >
+        Inner document of the `SignedEnvelope` returned by `GET /devices/{deviceId}/config`.
+        Decoded from base64, then JSON-parsed. The agent validates signature, expiry, device binding,
+        and version monotonicity before applying.
+      properties:
+        version:
+          type: integer
+          format: int64
+          description: Monotonically increasing. The agent rejects documents with a version ≤ its current version.
+          example: 42
+        issuedAtUtc:
+          type: string
+          format: date-time
+        expiresAtUtc:
+          type: string
+          format: date-time
+          description: Agent rejects the document after this time.
+        deviceId:
+          type: string
+          description: Optional binding. When set, the agent rejects the document if it does not match its own device ID.
+        intervalsSeconds:
+          type: object
+          additionalProperties:
+            type: integer
+          description: >
+            Collection interval overrides keyed by category name.
+            Valid keys: `heartbeat`, `device`, `hardware`, `hardware.peripherals`, `storage`,
+            `network.config`, `network.wifi`, `perf.cpu_memory`, `perf.disk`, `perf.network`,
+            `battery`, `software`, `security`, `events`, `health`, `diagnostics`.
+          example:
+            perf.cpu_memory: 30
+            hardware: 86400
+        collectorsEnabled:
+          type: object
+          additionalProperties:
+            type: boolean
+          description: Enable/disable individual collectors by category name.
+          example:
+            battery: false
+        syncIntervalSeconds:
+          type: integer
+          description: How often the sync engine drains the outbox. Clamped 5–3600 s.
+          example: 15
+        batchSize:
+          type: integer
+          description: Maximum records per ingest POST. Clamped 1–500.
+          example: 100
+        thresholds:
+          $ref: '#/components/schemas/ThresholdConfig'
+        retention:
+          $ref: '#/components/schemas/RetentionConfig'
+        softwarePolicy:
+          $ref: '#/components/schemas/SoftwarePolicy'
+        events:
+          $ref: '#/components/schemas/EventConfig'
+        networkProbes:
+          $ref: '#/components/schemas/NetworkProbeConfig'
+        diagnostics:
+          $ref: '#/components/schemas/DiagnosticRequest'
+          description: Null when no diagnostic run is requested.
+
+    UpdateManifest:
+      type: object
+      required: [version, packageUrl, sha256]
+      description: Inner document of the `SignedEnvelope` in `IngestResponse.update.manifest`.
+      properties:
+        version:
+          type: string
+          example: "1.3.0"
+        packageUrl:
+          type: string
+          format: uri
+          example: "https://updates.example.com/agent-1.3.0.zip"
+        sha256:
+          type: string
+          description: Lowercase hex SHA-256 of the package file. Verified after download before installation.
+          example: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        sizeBytes:
+          type: integer
+          format: int64
+          example: 8388608
+        runtime:
+          type: string
+          enum: [net48, net8, null]
+          description: "`net48` or `net8` selects the matching build. Null means any runtime accepts it."
+          example: "net48"
+        issuedAtUtc:
+          type: string
+          format: date-time
+        expiresAtUtc:
+          type: string
+          format: date-time
+          description: Agent rejects the offer after this time.
+
+    # =========================================================================
+    # Payload schemas (one per module)
+    # =========================================================================
+
+    # -- heartbeat ------------------------------------------------------------
+
+    CollectorStatus:
+      type: object
+      properties:
+        category:            { type: string, example: "perf.cpu_memory" }
+        lastSuccessUtc:      { type: string, format: date-time }
+        lastAttemptUtc:      { type: string, format: date-time }
+        consecutiveFailures: { type: integer, example: 0 }
+        lastError:           { type: string }
+        lastDurationMs:      { type: integer, format: int64, example: 38 }
+        enabled:             { type: boolean }
+
+    Heartbeat:
+      type: object
+      required: [deviceId, hostname, agentVersion, status, agentUptimeSeconds, configVersion, pendingRecords, deadLetterRecords]
+      properties:
+        deviceId:                { type: string }
+        hostname:                { type: string, example: "DESKTOP-ABC123" }
+        agentVersion:            { type: string, example: "1.2.3" }
+        status:                  { type: string, example: "online" }
+        agentUptimeSeconds:      { type: integer, format: int64 }
+        systemUptimeSeconds:     { type: integer, format: int64 }
+        configVersion:           { type: integer, format: int64, example: 42 }
+        lastSuccessfulSyncUtc:   { type: string, format: date-time }
+        clockSkewMs:             { type: integer, format: int64, description: "Positive = agent ahead of server." }
+        pendingRecords:          { type: integer }
+        deadLetterRecords:       { type: integer }
+        primaryIPv4:             { type: string, example: "192.168.1.50" }
+        osVersion:               { type: string, example: "10.0.22631" }
+        elevated:                { type: boolean }
+        agentCpuPercent:         { type: number, format: double }
+        agentWorkingSetBytes:    { type: integer, format: int64 }
+        collectors:
+          type: array
+          items:
+            $ref: '#/components/schemas/CollectorStatus'
+
+    # -- device ---------------------------------------------------------------
+
+    UserSessionInfo:
+      type: object
+      properties:
+        sessionId: { type: integer }
+        user:      { type: string }
+        domain:    { type: string }
+        state:     { type: string, enum: [active, disconnected] }
+        station:   { type: string, example: "Console" }
+
+    DeviceInfo:
+      type: object
+      properties:
+        deviceId:            { type: string }
+        hostname:            { type: string }
+        manufacturer:        { type: string, example: "Dell Inc." }
+        model:               { type: string, example: "Latitude 5540" }
+        serialNumber:        { type: string }
+        systemUuid:          { type: string }
+        chassisType:         { type: string, example: "Notebook" }
+        isLaptop:            { type: boolean }
+        isVirtualMachine:    { type: boolean }
+        assignedUser:        { type: string }
+        activeSessions:
+          type: array
+          items:
+            $ref: '#/components/schemas/UserSessionInfo'
+        domain:              { type: string }
+        partOfDomain:        { type: boolean }
+        domainType:          { type: string, enum: [domain, workgroup] }
+        firstRegisteredUtc:  { type: string, format: date-time }
+        lastBootUtc:         { type: string, format: date-time }
+        uptimeSeconds:       { type: integer, format: int64 }
+        status:              { type: string, enum: [online, degraded] }
+        timeZone:            { type: string, example: "India Standard Time" }
+        osCaption:           { type: string, example: "Microsoft Windows 11 Pro" }
+        osVersion:           { type: string, example: "10.0.22631" }
+        agentVersion:        { type: string }
+        agentRuntime:
+          type: string
+          enum: [".NET Framework 4.8", ".NET 8.0"]
+
+    # -- hardware -------------------------------------------------------------
+
+    ProcessorInfo:
+      type: object
+      properties:
+        manufacturer:              { type: string }
+        name:                      { type: string, example: "Intel Core i7-1365U" }
+        architecture:              { type: string, example: "x64" }
+        sockets:                   { type: integer }
+        cores:                     { type: integer }
+        logicalProcessors:         { type: integer }
+        maxClockMhz:               { type: integer }
+        currentClockMhz:           { type: integer }
+        l2CacheKb:                 { type: integer }
+        l3CacheKb:                 { type: integer }
+        currentUtilizationPercent: { type: number, format: double }
+
+    MemoryModuleInfo:
+      type: object
+      properties:
+        slot:                 { type: string, example: "DIMM0" }
+        bankLabel:            { type: string }
+        manufacturer:         { type: string }
+        partNumber:           { type: string }
+        serialNumber:         { type: string }
+        capacityBytes:        { type: integer, format: int64 }
+        type:                 { type: string, example: "LPDDR5" }
+        formFactor:           { type: string }
+        speedMhz:             { type: integer }
+        configuredSpeedMhz:   { type: integer }
+
+    MemoryInfo:
+      type: object
+      properties:
+        totalBytes:       { type: integer, format: int64 }
+        availableBytes:   { type: integer, format: int64 }
+        usedBytes:        { type: integer, format: int64 }
+        usedPercent:      { type: number, format: double }
+        slotsTotal:       { type: integer }
+        slotsUsed:        { type: integer }
+        maxCapacityBytes: { type: integer, format: int64 }
+        modules:
+          type: array
+          items:
+            $ref: '#/components/schemas/MemoryModuleInfo'
+
+    MotherboardInfo:
+      type: object
+      properties:
+        manufacturer: { type: string }
+        product:      { type: string }
+        version:      { type: string }
+        serialNumber: { type: string }
+
+    BiosInfo:
+      type: object
+      properties:
+        manufacturer:   { type: string }
+        version:        { type: string }
+        smbiosVersion:  { type: string }
+        releaseDateUtc: { type: string, format: date-time }
+
+    GpuInfo:
+      type: object
+      properties:
+        name:                       { type: string }
+        manufacturer:               { type: string }
+        memoryBytes:                { type: integer, format: int64 }
+        memoryMayBeCapped:          { type: boolean }
+        driverVersion:              { type: string }
+        driverDateUtc:              { type: string, format: date-time }
+        currentHorizontalResolution: { type: integer }
+        currentVerticalResolution:  { type: integer }
+        refreshRateHz:              { type: integer }
+        status:                     { type: string, example: "OK" }
+
+    MonitorInfo:
+      type: object
+      properties:
+        manufacturer:      { type: string }
+        model:             { type: string }
+        serialNumber:      { type: string }
+        yearOfManufacture: { type: integer }
+        diagonalInches:    { type: number, format: double }
+        instanceId:        { type: string }
+
+    BatteryInfo:
+      type: object
+      properties:
+        name:                    { type: string }
+        manufacturer:            { type: string }
+        serialNumber:            { type: string }
+        chemistry:               { type: string, example: "Lithium Ion" }
+        designCapacityMwh:       { type: integer, format: int64 }
+        fullChargeCapacityMwh:   { type: integer, format: int64 }
+        healthPercent:           { type: number, format: double }
+        cycleCount:              { type: integer }
+        chargePercent:           { type: integer }
+        chargingStatus:          { type: string, example: "Discharging" }
+
+    PeripheralInfo:
+      type: object
+      properties:
+        name:         { type: string }
+        deviceClass:  { type: string }
+        manufacturer: { type: string }
+        deviceId:     { type: string }
+        connection:
+          type: string
+          enum: [usb, bluetooth]
+        status:       { type: string }
+
+    HardwareInventory:
+      type: object
+      required: [scope]
+      properties:
+        scope:
+          type: string
+          enum: [full, peripherals]
+          description: "`full` = 24 h inventory. `peripherals` = 5 min PnP scan for connect/disconnect detection."
+        processor:
+          $ref: '#/components/schemas/ProcessorInfo'
+        memory:
+          $ref: '#/components/schemas/MemoryInfo'
+        motherboard:
+          $ref: '#/components/schemas/MotherboardInfo'
+        bios:
+          $ref: '#/components/schemas/BiosInfo'
+        gpus:
+          type: array
+          items:
+            $ref: '#/components/schemas/GpuInfo'
+        monitors:
+          type: array
+          items:
+            $ref: '#/components/schemas/MonitorInfo'
+        batteries:
+          type: array
+          items:
+            $ref: '#/components/schemas/BatteryInfo'
+        peripherals:
+          type: array
+          items:
+            $ref: '#/components/schemas/PeripheralInfo'
+
+    # -- storage --------------------------------------------------------------
+
+    PartitionInfo:
+      type: object
+      properties:
+        index:            { type: integer }
+        type:             { type: string, example: "GPT: Basic Data" }
+        sizeBytes:        { type: integer, format: int64 }
+        startOffsetBytes: { type: integer, format: int64 }
+        isBootPartition:  { type: boolean }
+        isPrimary:        { type: boolean }
+        driveLetters:
+          type: array
+          items: { type: string }
+
+    PhysicalDiskInfo:
+      type: object
+      properties:
+        deviceId:          { type: string, example: "\\\\.\\PhysicalDrive0" }
+        index:             { type: integer }
+        manufacturer:      { type: string }
+        model:             { type: string }
+        serialNumber:      { type: string }
+        mediaType:
+          type: string
+          enum: [HDD, SSD, NVMe, Unknown]
+        busType:           { type: string }
+        sizeBytes:         { type: integer, format: int64 }
+        healthStatus:
+          type: string
+          enum: [Healthy, Warning, Unhealthy, Unknown]
+        operationalStatus: { type: string }
+        smartPredictFailure: { type: boolean }
+        temperatureC:      { type: integer }
+        powerOnHours:      { type: integer, format: int64 }
+        wearPercent:       { type: integer, description: "NVMe/SSD wear indicator. 0 = new, 100 = worn out." }
+        smartSource:
+          type: string
+          enum: [storage-reliability, ata-smart, none]
+        firmwareVersion:   { type: string }
+        partitions:
+          type: array
+          items:
+            $ref: '#/components/schemas/PartitionInfo'
+
+    VolumeInfo:
+      type: object
+      properties:
+        driveLetter:    { type: string, example: "C" }
+        label:          { type: string }
+        fileSystem:     { type: string, example: "NTFS" }
+        driveType:      { type: string, example: "Fixed" }
+        totalBytes:     { type: integer, format: int64 }
+        freeBytes:      { type: integer, format: int64 }
+        usedBytes:      { type: integer, format: int64 }
+        usedPercent:    { type: number, format: double }
+        isSystemDrive:  { type: boolean }
+        physicalDiskId: { type: string }
+
+    StorageInventory:
+      type: object
+      properties:
+        disks:
+          type: array
+          items:
+            $ref: '#/components/schemas/PhysicalDiskInfo'
+        volumes:
+          type: array
+          items:
+            $ref: '#/components/schemas/VolumeInfo'
+
+    # -- network --------------------------------------------------------------
+
+    AdapterInfo:
+      type: object
+      properties:
+        id:               { type: string }
+        name:             { type: string }
+        description:      { type: string }
+        manufacturer:     { type: string }
+        model:            { type: string }
+        macAddress:       { type: string, example: "AA:BB:CC:DD:EE:FF" }
+        adapterType:
+          type: string
+          enum: [Ethernet, Wi-Fi, VPN, Virtual, Loopback, Bluetooth, Mobile, Other]
+        status:           { type: string, example: "Up" }
+        connectionStatus: { type: string }
+        isPhysical:       { type: boolean }
+        driverVersion:    { type: string }
+        driverDateUtc:    { type: string, format: date-time }
+        driverProvider:   { type: string }
+        speedBitsPerSecond: { type: integer, format: int64 }
+        ipv4Addresses:    { type: array, items: { type: string } }
+        ipv6Addresses:    { type: array, items: { type: string } }
+        subnetMasks:      { type: array, items: { type: string } }
+        defaultGateways:  { type: array, items: { type: string } }
+        dnsServers:       { type: array, items: { type: string } }
+        dhcpEnabled:      { type: boolean }
+        dhcpServer:       { type: string }
+        dnsSuffix:        { type: string }
+
+    WifiInfo:
+      type: object
+      properties:
+        adapterPresent:          { type: boolean }
+        connected:               { type: boolean }
+        adapterName:             { type: string }
+        adapterModel:            { type: string }
+        ssid:                    { type: string }
+        bssid:                   { type: string }
+        signalQualityPercent:    { type: integer }
+        signalStrengthDbm:       { type: integer }
+        frequencyMhz:            { type: integer }
+        channel:                 { type: integer }
+        band:                    { type: string, enum: ["2.4 GHz", "5 GHz", "6 GHz"] }
+        radioType:               { type: string, example: "802.11ax" }
+        wifiStandard:            { type: string, enum: ["Wi-Fi 4", "Wi-Fi 5", "Wi-Fi 6", "Wi-Fi 6E", "Wi-Fi 7"] }
+        receiveRateMbps:         { type: integer, format: int64 }
+        transmitRateMbps:        { type: integer, format: int64 }
+        authentication:          { type: string, example: "WPA2-Enterprise" }
+        cipher:                  { type: string, example: "CCMP" }
+        connectedSinceUtc:       { type: string, format: date-time }
+        connectionDurationSeconds: { type: integer, format: int64 }
+        state:                   { type: string }
+
+    NetworkInfo:
+      type: object
+      required: [scope]
+      properties:
+        scope:
+          type: string
+          enum: [configuration, wifi]
+          description: "`configuration` = adapters + IP. `wifi` = Wi-Fi scan only."
+        hostname:    { type: string }
+        primaryIPv4: { type: string }
+        adapters:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdapterInfo'
+        wifi:
+          $ref: '#/components/schemas/WifiInfo'
+
+    # -- performance ----------------------------------------------------------
+
+    CpuMetrics:
+      type: object
+      properties:
+        usagePercent:      { type: number, format: double }
+        logicalProcessors: { type: integer }
+        currentClockMhz:   { type: integer }
+
+    MemoryMetrics:
+      type: object
+      properties:
+        totalBytes:       { type: integer, format: int64 }
+        availableBytes:   { type: integer, format: int64 }
+        usedBytes:        { type: integer, format: int64 }
+        usedPercent:      { type: number, format: double }
+        commitTotalBytes: { type: integer, format: int64 }
+        commitUsedBytes:  { type: integer, format: int64 }
+
+    DiskPerfMetrics:
+      type: object
+      properties:
+        name:             { type: string, example: "PhysicalDrive0" }
+        readBytesPerSec:  { type: number, format: double }
+        writeBytesPerSec: { type: number, format: double }
+        readIops:         { type: number, format: double }
+        writeIops:        { type: number, format: double }
+        busyPercent:      { type: number, format: double }
+        queueLength:      { type: number, format: double }
+        avgLatencyMs:     { type: number, format: double }
+
+    NetworkEvent:
+      type: object
+      properties:
+        timestampUtc: { type: string, format: date-time }
+        type:
+          type: string
+          enum: [adapter_up, adapter_down, internet_lost, internet_restored, adapter_added, adapter_removed]
+        adapter:  { type: string }
+        detail:   { type: string }
+
+    NetworkPerfMetrics:
+      type: object
+      properties:
+        downloadBytesPerSec:  { type: number, format: double }
+        uploadBytesPerSec:    { type: number, format: double }
+        totalDownloadedBytes: { type: integer, format: int64 }
+        totalUploadedBytes:   { type: integer, format: int64 }
+        utilizationPercent:   { type: number, format: double }
+        latencyMs:            { type: number, format: double }
+        packetLossPercent:    { type: number, format: double }
+        latencyTarget:        { type: string, example: "8.8.8.8" }
+        internetReachable:    { type: boolean }
+        apiReachable:         { type: boolean }
+        vpnConnected:         { type: boolean }
+        vpnAdapters:          { type: array, items: { type: string } }
+        activeAdapter:        { type: string }
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/NetworkEvent'
+
+    BatteryStatusInfo:
+      type: object
+      properties:
+        present:                    { type: boolean }
+        chargePercent:              { type: integer }
+        chargingStatus:
+          type: string
+          enum: [Charging, Discharging, Full, Unknown]
+        onAcPower:                  { type: boolean }
+        estimatedMinutesRemaining:  { type: integer }
+        healthPercent:              { type: number, format: double }
+        cycleCount:                 { type: integer }
+
+    ProcessUsage:
+      type: object
+      properties:
+        pid:              { type: integer }
+        name:             { type: string }
+        cpuPercent:       { type: number, format: double }
+        workingSetBytes:  { type: integer, format: int64 }
+        privateBytes:     { type: integer, format: int64 }
+
+    PerformanceMetrics:
+      type: object
+      required: [sections]
+      description: >
+        Partial snapshot. Each performance collector fills only its own sections.
+        `sections` lists which keys are present in this record.
+      properties:
+        sections:
+          type: array
+          items:
+            type: string
+            enum: [cpu, memory, disks, network, battery, processes, temperature]
+        cpu:
+          $ref: '#/components/schemas/CpuMetrics'
+        memory:
+          $ref: '#/components/schemas/MemoryMetrics'
+        disks:
+          type: array
+          items:
+            $ref: '#/components/schemas/DiskPerfMetrics'
+        network:
+          $ref: '#/components/schemas/NetworkPerfMetrics'
+        battery:
+          $ref: '#/components/schemas/BatteryStatusInfo'
+        uptimeSeconds:    { type: integer, format: int64 }
+        processCount:     { type: integer }
+        topCpuProcesses:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProcessUsage'
+        topMemoryProcesses:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProcessUsage'
+        temperatureC:     { type: number, format: double }
+        temperatureSource: { type: string, example: "MSAcpi_ThermalZoneTemperature" }
+
+    # -- software -------------------------------------------------------------
+
+    OperatingSystemInfo:
+      type: object
+      properties:
+        caption:          { type: string, example: "Microsoft Windows 11 Pro" }
+        edition:          { type: string, example: "Professional" }
+        version:          { type: string, example: "10.0.22631" }
+        displayVersion:   { type: string, example: "23H2" }
+        buildNumber:      { type: string }
+        revision:         { type: integer }
+        architecture:     { type: string, example: "x64" }
+        servicePack:      { type: string }
+        installDateUtc:   { type: string, format: date-time }
+        activationStatus:
+          type: string
+          enum: [Licensed, Unlicensed, Grace, Notification, Unknown]
+        activationDetail: { type: string }
+
+    InstalledApplication:
+      type: object
+      properties:
+        key:
+          type: string
+          description: "Stable composite key: `scope|arch|registry-key-name`"
+          example: "machine|x64|{27C7E5A1-5B1B-4F4D-B4F6-C6E6D3A5A5A5}"
+        name:                     { type: string }
+        version:                  { type: string }
+        publisher:                { type: string }
+        installDateUtc:           { type: string, format: date-time }
+        installLocation:          { type: string }
+        architecture:             { type: string, enum: [x86, x64] }
+        scope:                    { type: string, enum: [machine, user] }
+        uninstallCommand:         { type: string }
+        quietUninstallCommand:    { type: string }
+        isUnauthorized:           { type: boolean }
+        policyMatch:              { type: string, description: "The pattern that flagged this application." }
+        isOutdated:               { type: boolean }
+        minimumRequiredVersion:   { type: string }
+        isPotentiallyUnwanted:    { type: boolean }
+
+    InstalledUpdate:
+      type: object
+      properties:
+        id:               { type: string, example: "KB5031455" }
+        description:      { type: string }
+        installedOnUtc:   { type: string, format: date-time }
+        installedBy:      { type: string }
+        isSecurityUpdate: { type: boolean }
+
+    UpdateHistoryEntry:
+      type: object
+      properties:
+        title:    { type: string }
+        dateUtc:  { type: string, format: date-time }
+        result:   { type: string }
+        hResult:  { type: string, example: "0x80070643" }
+
+    WindowsUpdateSummary:
+      type: object
+      properties:
+        latestSecurityUpdateId:    { type: string }
+        latestSecurityUpdateUtc:   { type: string, format: date-time }
+        lastUpdateInstalledUtc:    { type: string, format: date-time }
+        pendingUpdateCount:        { type: integer }
+        pendingUpdateTitles:       { type: array, items: { type: string } }
+        pendingDetection:          { type: string, enum: [wua-cached, unavailable] }
+        recentFailures:
+          type: array
+          items:
+            $ref: '#/components/schemas/UpdateHistoryEntry'
+
+    SoftwareInventory:
+      type: object
+      properties:
+        os:
+          $ref: '#/components/schemas/OperatingSystemInfo'
+        applications:
+          type: array
+          items:
+            $ref: '#/components/schemas/InstalledApplication'
+        updates:
+          type: array
+          items:
+            $ref: '#/components/schemas/InstalledUpdate'
+        updateSummary:
+          $ref: '#/components/schemas/WindowsUpdateSummary'
+
+    # -- security -------------------------------------------------------------
+
+    AntivirusProduct:
+      type: object
+      properties:
+        name:               { type: string }
+        enabled:            { type: boolean }
+        signaturesUpToDate: { type: boolean }
+        rawState:           { type: integer, format: int64, description: "Raw SecurityCenter2 productState bitmask." }
+        source:             { type: string, enum: [security-center] }
+
+    ThreatDetection:
+      type: object
+      properties:
+        threatName:             { type: string }
+        severity:               { type: string }
+        category:               { type: string }
+        isPotentiallyUnwanted:  { type: boolean }
+        detectedUtc:            { type: string, format: date-time }
+        actionSuccess:          { type: string }
+
+    DefenderStatus:
+      type: object
+      properties:
+        present:                    { type: boolean }
+        serviceRunning:             { type: boolean }
+        antivirusEnabled:           { type: boolean }
+        antispywareEnabled:         { type: boolean }
+        realTimeProtectionEnabled:  { type: boolean }
+        tamperProtected:            { type: boolean }
+        engineVersion:              { type: string }
+        signatureVersion:           { type: string }
+        signatureLastUpdatedUtc:    { type: string, format: date-time }
+        signatureAgeDays:           { type: integer }
+        lastQuickScanUtc:           { type: string, format: date-time }
+        lastFullScanUtc:            { type: string, format: date-time }
+        recentThreats:
+          type: array
+          items:
+            $ref: '#/components/schemas/ThreatDetection'
+        source:                     { type: string, enum: [wmi, registry] }
+
+    AntivirusStatus:
+      type: object
+      properties:
+        products:
+          type: array
+          items:
+            $ref: '#/components/schemas/AntivirusProduct'
+        defender:
+          $ref: '#/components/schemas/DefenderStatus'
+
+    FirewallStatus:
+      type: object
+      properties:
+        serviceRunning:        { type: boolean }
+        domainProfileEnabled:  { type: boolean }
+        privateProfileEnabled: { type: boolean }
+        publicProfileEnabled:  { type: boolean }
+        activeProfiles:        { type: string, example: "Domain" }
+        source:                { type: string, enum: [com, registry] }
+
+    TpmStatus:
+      type: object
+      properties:
+        present:              { type: boolean }
+        enabled:              { type: boolean }
+        activated:            { type: boolean }
+        specVersion:          { type: string, example: "2.0" }
+        manufacturerVersion:  { type: string }
+
+    BitLockerVolume:
+      type: object
+      properties:
+        driveLetter:      { type: string }
+        protectionStatus: { type: string, enum: [On, Off, Unknown] }
+        conversionStatus: { type: string }
+        encryptionMethod: { type: string, example: "XtsAes256" }
+
+    EncryptionStatus:
+      type: object
+      properties:
+        bitLockerState:
+          type: string
+          enum: [Available, NotAvailable, Unknown]
+        systemDriveProtected:   { type: boolean }
+        deviceEncryptionActive: { type: boolean }
+        volumes:
+          type: array
+          items:
+            $ref: '#/components/schemas/BitLockerVolume'
+
+    WindowsUpdateSecurity:
+      type: object
+      properties:
+        serviceEnabled:               { type: boolean }
+        autoUpdateMode:               { type: string }
+        lastSuccessfulInstallUtc:     { type: string, format: date-time }
+        daysSinceLastSuccessfulInstall: { type: integer }
+        managedByPolicy:              { type: boolean }
+
+    PendingRestartStatus:
+      type: object
+      properties:
+        pending: { type: boolean }
+        reasons: { type: array, items: { type: string } }
+
+    UacStatus:
+      type: object
+      properties:
+        enabled:                     { type: boolean }
+        consentPromptBehaviorAdmin:  { type: integer }
+        secureDesktopPrompt:         { type: boolean }
+        level:
+          type: string
+          enum: [AlwaysNotify, Default, NoDim, Disabled, Custom]
+
+    AccountPolicyStatus:
+      type: object
+      properties:
+        minimumPasswordLength:        { type: integer }
+        maximumPasswordAgeDays:       { type: integer }
+        minimumPasswordAgeDays:       { type: integer }
+        passwordHistoryLength:        { type: integer }
+        lockoutThreshold:             { type: integer }
+        lockoutDurationMinutes:       { type: integer }
+        lockoutObservationMinutes:    { type: integer }
+        scope:                        { type: string, example: "local-machine policy" }
+
+    SecurityStatus:
+      type: object
+      properties:
+        antivirus:      { $ref: '#/components/schemas/AntivirusStatus' }
+        firewall:       { $ref: '#/components/schemas/FirewallStatus' }
+        tpm:            { $ref: '#/components/schemas/TpmStatus' }
+        secureBoot:
+          type: string
+          enum: [Enabled, Disabled, Unsupported, Unknown]
+        encryption:     { $ref: '#/components/schemas/EncryptionStatus' }
+        windowsUpdate:  { $ref: '#/components/schemas/WindowsUpdateSecurity' }
+        pendingRestart: { $ref: '#/components/schemas/PendingRestartStatus' }
+        uac:            { $ref: '#/components/schemas/UacStatus' }
+        accountPolicy:  { $ref: '#/components/schemas/AccountPolicyStatus' }
+        elevated:       { type: boolean }
+        limitations:
+          type: array
+          items: { type: string }
+          description: Data the agent could not read due to insufficient privilege, missing hardware, or OS version.
+
+    # -- events ---------------------------------------------------------------
+
+    WindowsEventRecord:
+      type: object
+      required: [log, recordId, eventId, source, level, timestampUtc]
+      properties:
+        deviceId:     { type: string }
+        log:          { type: string, example: "System" }
+        recordId:     { type: integer, format: int64 }
+        eventId:      { type: integer }
+        source:       { type: string, example: "Service Control Manager" }
+        level:
+          type: string
+          enum: [critical, error, warning, information, verbose]
+        message:      { type: string }
+        timestampUtc: { type: string, format: date-time }
+        category:
+          type: string
+          description: >
+            Semantic category assigned by the agent's EventCatalog:
+            `application_error`, `bsod`, `unexpected_shutdown`, `service_failure`,
+            `driver_error`, `network_event`, `security_event`, `update_failure`, and others.
+          example: "service_failure"
+        severity:
+          $ref: '#/components/schemas/Severity'
+        computer:     { type: string }
+        metadata:
+          type: object
+          additionalProperties: { type: string }
+
+    WindowsEventBatch:
+      type: object
+      required: [fromUtc, toUtc, droppedCount, events]
+      properties:
+        fromUtc:      { type: string, format: date-time }
+        toUtc:        { type: string, format: date-time }
+        droppedCount:
+          type: integer
+          description: Events that were collected but dropped because they exceeded `maxEventsPerCycle`.
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/WindowsEventRecord'
+
+    # -- health ---------------------------------------------------------------
+
+    HealthFactor:
+      type: object
+      properties:
+        name:    { type: string }
+        status:  { type: string, enum: [ok, warning, critical, unknown] }
+        detail:  { type: string }
+        penalty: { type: integer, description: "Points subtracted from the 100-point health score." }
+
+    RecurringProblem:
+      type: object
+      properties:
+        key:         { type: string, description: "Stable composite of EventId + Source." }
+        source:      { type: string }
+        eventId:     { type: integer }
+        description: { type: string }
+        occurrences: { type: integer }
+        firstSeenUtc: { type: string, format: date-time }
+        lastSeenUtc:  { type: string, format: date-time }
+
+    MaintenanceEntry:
+      type: object
+      properties:
+        timestampUtc: { type: string, format: date-time }
+        type:
+          type: string
+          enum: [software_installed, update_installed, reboot, hardware_change]
+        summary: { type: string }
+
+    DeviceHealth:
+      type: object
+      required: [score, status]
+      properties:
+        score:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: Composite health score. 100 = perfect.
+        status:
+          type: string
+          enum: [healthy, warning, critical]
+        factors:
+          type: array
+          items:
+            $ref: '#/components/schemas/HealthFactor'
+        recurringProblems:
+          type: array
+          items:
+            $ref: '#/components/schemas/RecurringProblem'
+        unexpectedShutdownsLast30Days: { type: integer }
+        bugChecksLast30Days:           { type: integer }
+        lastBootUtc:                   { type: string, format: date-time }
+        pendingRestart:                { type: boolean }
+        recentMaintenance:
+          type: array
+          items:
+            $ref: '#/components/schemas/MaintenanceEntry'
+
+    # -- diagnostics ----------------------------------------------------------
+
+    ServiceInfo:
+      type: object
+      properties:
+        name:        { type: string }
+        displayName: { type: string }
+        state:       { type: string }
+        startMode:   { type: string }
+        exitCode:    { type: integer, format: int64 }
+
+    ProblemDevice:
+      type: object
+      properties:
+        name:             { type: string }
+        deviceClass:      { type: string }
+        deviceId:         { type: string }
+        errorCode:        { type: integer }
+        errorDescription: { type: string }
+
+    StartupItem:
+      type: object
+      properties:
+        name:     { type: string }
+        location: { type: string }
+        command:  { type: string }
+
+    DiagnosticReport:
+      type: object
+      required: [requestId, generatedUtc, sections]
+      properties:
+        requestId:   { type: string }
+        generatedUtc: { type: string, format: date-time }
+        sections:
+          type: array
+          items:
+            type: string
+            enum: [services, problem_devices, startup_items, recent_errors]
+        stoppedAutoStartServices:
+          type: array
+          items:
+            $ref: '#/components/schemas/ServiceInfo'
+        problemDevices:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProblemDevice'
+        startupItems:
+          type: array
+          items:
+            $ref: '#/components/schemas/StartupItem'
+        recentErrors:
+          type: array
+          items:
+            $ref: '#/components/schemas/WindowsEventRecord'
+        errors:
+          type: array
+          items: { type: string }
+          description: Collector-level errors encountered while building the report.
+
+    # -- alerts ---------------------------------------------------------------
+
+    AlertRecord:
+      type: object
+      required: [alertKey, rule, subject, state, severity, message, timestampUtc]
+      properties:
+        alertKey:
+          type: string
+          description: "Stable identifier: `{rule}|{subject}`. Consistent across raise and clear transitions."
+          example: "cpu_sustained|system"
+        rule:       { type: string, example: "cpu_sustained" }
+        subject:    { type: string, example: "system" }
+        state:
+          type: string
+          enum: [raised, cleared, event]
+        severity:
+          $ref: '#/components/schemas/Severity'
+        message:    { type: string }
+        value:      { type: number, format: double, description: "Measured value that triggered the rule." }
+        threshold:  { type: number, format: double }
+        timestampUtc: { type: string, format: date-time }
+        metadata:
+          type: object
+          additionalProperties: { type: string }
+
+    # -- changes --------------------------------------------------------------
+
+    ChangeRecord:
+      type: object
+      required: [category, changeClass, changeType, detectedUtc]
+      properties:
+        category:
+          type: string
+          enum: [hardware, storage, network, software]
+        changeClass:
+          type: string
+          description: "Fine-grained change class, e.g. `ram_changed`, `storage_replaced`, `software_installed`."
+          example: "ram_changed"
+        changeType:
+          type: string
+          enum: [added, removed, modified]
+        itemKind:    { type: string, example: "MemoryModule" }
+        itemKey:     { type: string, example: "DIMM0" }
+        displayName: { type: string }
+        summary:     { type: string }
+        before:      { type: string }
+        after:       { type: string }
+        detectedUtc: { type: string, format: date-time }
+
+# =============================================================================
+# Paths
+# =============================================================================
+
+paths:
+
+  /ping:
+    get:
+      operationId: ping
+      summary: Health check
+      description: >
+        Lightweight liveness probe. The agent calls this to verify API reachability
+        before attempting registration or data sync. No authentication required.
+      tags: [Agent Lifecycle]
+      responses:
+        '200':
+          description: API is reachable.
+        '5XX':
+          $ref: '#/components/responses/ServerError'
+
+  /devices/register:
+    post:
+      operationId: registerDevice
+      summary: Register device or poll for approval
+      description: |
+        Called repeatedly by the agent until `status` is `"approved"` or `"rejected"`.
+
+        **State machine:**
+        ```
+        unregistered ──POST──> pending ──admin approves──> approved
+                                     └──admin rejects──> rejected
+        ```
+
+        The full `inventory` block is sent **only on the first call**; subsequent
+        approval-poll calls omit it to reduce payload size.
+
+        **Back-off rules (agent-side):**
+        | Response | Action |
+        |---|---|
+        | `status: pending` | Wait `pollAfterSeconds` (default 60 s) |
+        | `status: rejected` | Back off 1 hour; log `message` |
+        | `429` | Respect `Retry-After` header |
+        | `401 / 403` | Back off 15 min; check registration token |
+        | Network error | Exponential back-off, base 30 s |
+      tags: [Agent Lifecycle]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegistrationRequest'
+            example:
+              schemaVersion: "1.0"
+              deviceId: "b3d2f1a0-cafe-4321-babe-000000000001"
+              registrationToken: "reg-tok-abc123"
+              agentVersion: "1.2.3"
+              hostname: "DESKTOP-ABC123"
+              requestedUtc: "2026-11-19T04:37:02Z"
+              metadata:
+                group: "engineering"
+                site: "london"
+              fingerprint:
+                systemUuid: "4c4c4544-0059-5410-8052-b8c04f575931"
+                serialNumber: "ABC1234"
+                manufacturer: "Dell Inc."
+                model: "Latitude 5540"
+                macAddresses: ["aa:bb:cc:dd:ee:ff"]
+      responses:
+        '200':
+          description: Registration response (check `status` field).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegistrationResponse'
+              examples:
+                pending:
+                  summary: Waiting for administrator approval
+                  value:
+                    status: "pending"
+                    deviceId: "b3d2f1a0-cafe-4321-babe-000000000001"
+                    pollAfterSeconds: 60
+                    serverTimeUtc: "2026-11-19T04:37:02Z"
+                approved:
+                  summary: Approved — credential issued
+                  value:
+                    status: "approved"
+                    deviceId: "b3d2f1a0-cafe-4321-babe-000000000001"
+                    credential:
+                      secret: "eyJhbGciOiJIUzI1NiJ9..."
+                      keyId: "key-2026-Q4"
+                      expiresUtc: "2027-11-19T04:37:02Z"
+                    pollAfterSeconds: 60
+                    serverTimeUtc: "2026-11-19T04:37:02Z"
+                rejected:
+                  summary: Rejected by administrator
+                  value:
+                    status: "rejected"
+                    deviceId: "b3d2f1a0-cafe-4321-babe-000000000001"
+                    message: "Unrecognised device — not an authorised company laptop."
+                    serverTimeUtc: "2026-11-19T04:37:02Z"
+        '400':
+          description: Invalid request body (missing required field, bad schema version, etc.).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '401':
+          description: Invalid or expired registration token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '5XX':
+          $ref: '#/components/responses/ServerError'
+
+  /devices/{deviceId}/{module}:
+    post:
+      operationId: ingestBatch
+      summary: Submit a batch of collected records
+      description: |
+        Drains the agent's SQLite outbox to the server. One call per module per drain cycle.
+
+        **Idempotency:** Every call carries an `Idempotency-Key` header. Re-sending the same
+        key is safe — the server deduplicates on that key and returns the same response.
+
+        **Acknowledgement logic (agent-side):**
+        - A record not listed in `rejected` is considered **accepted**.
+        - `retryable: true` → re-queued for retry after 60 s.
+        - `retryable: false` → moved to dead-letter queue; never retried.
+        - A 4xx on a multi-record batch triggers individual record split-and-retry.
+
+        **Config / update piggybacking:**  
+        When `configVersion` in the response exceeds the agent's local version the agent
+        immediately calls `GET /devices/{deviceId}/config`. When `update.manifest` is
+        present the agent validates and applies the update offer.
+      tags: [Data Ingestion]
+      security:
+        - DeviceBearer: []
+      parameters:
+        - $ref: '#/components/parameters/deviceId'
+        - $ref: '#/components/parameters/module'
+        - $ref: '#/components/parameters/idempotencyKey'
+        - name: X-Agent-Version
+          in: header
+          required: true
+          schema:
+            type: string
+          example: "1.2.3"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IngestBatch'
+            examples:
+              heartbeat:
+                summary: Heartbeat batch
+                value:
+                  schemaVersion: "1.0"
+                  deviceId: "b3d2f1a0-cafe-4321-babe-000000000001"
+                  module: "heartbeat"
+                  sentUtc: "2026-11-19T04:37:02Z"
+                  records:
+                    - id: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"
+                      category: "heartbeat"
+                      collectedAtUtc: "2026-11-19T04:36:57Z"
+                      payload:
+                        deviceId: "b3d2f1a0-cafe-4321-babe-000000000001"
+                        hostname: "DESKTOP-ABC123"
+                        agentVersion: "1.2.3"
+                        status: "online"
+                        agentUptimeSeconds: 3600
+                        systemUptimeSeconds: 86400
+                        configVersion: 42
+                        pendingRecords: 0
+                        deadLetterRecords: 0
+                        primaryIPv4: "192.168.1.50"
+                        osVersion: "10.0.22631"
+                        elevated: true
+              performance:
+                summary: CPU/RAM performance batch
+                value:
+                  schemaVersion: "1.0"
+                  deviceId: "b3d2f1a0-cafe-4321-babe-000000000001"
+                  module: "performance"
+                  sentUtc: "2026-11-19T04:37:02Z"
+                  records:
+                    - id: "b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5"
+                      category: "perf.cpu_memory"
+                      collectedAtUtc: "2026-11-19T04:36:57Z"
+                      payload:
+                        sections: ["cpu", "memory"]
+                        cpu:
+                          usagePercent: 24.5
+                          logicalProcessors: 12
+                          currentClockMhz: 2400
+                        memory:
+                          totalBytes: 17179869184
+                          availableBytes: 9663676416
+                          usedBytes: 7516192768
+                          usedPercent: 43.75
+      responses:
+        '200':
+          description: Batch processed. Check `rejected` for per-record results.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestResponse'
+              examples:
+                allAccepted:
+                  summary: All records accepted
+                  value:
+                    status: "ok"
+                    accepted: ["a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"]
+                    serverTimeUtc: "2026-11-19T04:37:02Z"
+                    configVersion: 42
+                withUpdate:
+                  summary: Accepted with update offer
+                  value:
+                    status: "ok"
+                    accepted: ["a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"]
+                    serverTimeUtc: "2026-11-19T04:37:02Z"
+                    configVersion: 43
+                    update:
+                      manifest:
+                        payload: "eyJ2ZXJzaW9uIjoiMS4zLjAiLC4uLn0="
+                        signature: "base64signaturehere=="
+                        keyId: "update-key-2026"
+                partialReject:
+                  summary: Some records rejected
+                  value:
+                    status: "partial"
+                    accepted: ["a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"]
+                    rejected:
+                      - id: "b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5"
+                        code: "SCHEMA_ERROR"
+                        message: "usedPercent must be between 0 and 100"
+                        retryable: false
+                    serverTimeUtc: "2026-11-19T04:37:02Z"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '5XX':
+          $ref: '#/components/responses/ServerError'
+
+  /devices/{deviceId}/config:
+    get:
+      operationId: getConfig
+      summary: Fetch remote configuration
+      description: |
+        Returns the current `AgentConfigDocument` wrapped in a `SignedEnvelope`.
+
+        The agent:
+        1. Verifies the RSA-SHA256 signature using the PEM public key in `appsettings.json`.
+        2. Checks `expiresAtUtc` is in the future.
+        3. Checks `deviceId` (when present) matches its own device ID.
+        4. Rejects documents with `version ≤ currentVersion`.
+        5. Caches the raw envelope to disk for cold-start offline use.
+
+        The agent calls this endpoint:
+        - On start-up (loads cached version first, then fetches fresh).
+        - Whenever `IngestResponse.configVersion` exceeds the local version.
+        - At most once every 60 seconds (back-off guard).
+      tags: [Configuration]
+      security:
+        - DeviceBearer: []
+      parameters:
+        - $ref: '#/components/parameters/deviceId'
+        - name: X-Agent-Version
+          in: header
+          required: true
+          schema:
+            type: string
+          example: "1.2.3"
+      responses:
+        '200':
+          description: Signed configuration envelope.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SignedEnvelope'
+              example:
+                payload: "eyJ2ZXJzaW9uIjo0MiwiZXhwaXJlc0F0VXRjIjoiMjAyNy0xMS0xOVQwMDowMDowMFoiLCJpbnRlcnZhbHNTZWNvbmRzIjp7InBlcmYuY3B1X21lbW9yeSI6MzB9fQ=="
+                signature: "base64RSASignatureHere=="
+                keyId: "config-key-2026"
+        '204':
+          description: No configuration change since last fetch (agent keeps its cached version).
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '5XX':
+          $ref: '#/components/responses/ServerError'
+
+# =============================================================================
+# Tags
+# =============================================================================
+
+tags:
+  - name: Agent Lifecycle
+    description: Device registration and health probes.
+  - name: Data Ingestion
+    description: >
+      Batch upload of all collected monitoring data. One endpoint for all modules;
+      the `{module}` path parameter selects the data domain.
+  - name: Configuration
+    description: >
+      Signed remote configuration delivery. The backend pushes config by incrementing
+      `configVersion` in the next ingest response; the agent then fetches this endpoint.
