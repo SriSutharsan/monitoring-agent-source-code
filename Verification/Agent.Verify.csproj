@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    OFFLINE VERIFICATION HARNESS (not shipped).
+    Compiles the *same source files* as the production projects against the .NET 8 shared framework
+    (which includes Microsoft.Extensions.* and System.Text.Json) so that logic can be compiled and executed
+    on a machine that cannot restore NuGet packages (e.g. CI sandbox / Linux).
+    Files needing Windows-only NuGet packages (SQLite, Serilog, System.Management, DPAPI, EventLog) are excluded here;
+    they are compiled by the real projects on a Windows build machine.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Agent.Verify</RootNamespace>
+    <AssemblyName>Agent.Verify</AssemblyName>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <DefineConstants>$(DefineConstants);VERIFY_HARNESS</DefineConstants>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="*.cs;Shims\**\*.cs;Tests\**\*.cs" />
+    <Compile Include="..\Agent.Models\**\*.cs" Exclude="..\Agent.Models\obj\**;..\Agent.Models\bin\**" />
+    <Compile Include="..\Agent.Core\**\*.cs" Exclude="..\Agent.Core\obj\**;..\Agent.Core\bin\**" />
+    <Compile Include="..\Agent.Configuration\**\*.cs" Exclude="..\Agent.Configuration\obj\**;..\Agent.Configuration\bin\**;..\Agent.Configuration\DpapiCredentialStore.cs" />
+    <Compile Include="..\Agent.Logging\SecretRedactor.cs" />
+    <Compile Include="..\Agent.Collectors\**\*.cs" Exclude="..\Agent.Collectors\obj\**;..\Agent.Collectors\bin\**;..\Agent.Collectors\Platform\**" />
+    <Compile Include="..\Tools\MockApi\MockApiServer.cs" />
+    <Compile Include="..\Agent.Communication\**\*.cs" Exclude="..\Agent.Communication\obj\**;..\Agent.Communication\bin\**" />
+    <Compile Include="..\Agent.Storage\SqlStatements.cs;..\Agent.Storage\SqliteStore.cs" />
+  </ItemGroup>
+</Project>

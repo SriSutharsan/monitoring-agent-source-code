@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>Agent.Models</RootNamespace>
+    <AssemblyName>Agent.Models</AssemblyName>
+  </PropertyGroup>
+  <!-- System.Text.Json is in-box on net8; net48 needs the package. -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'net48'">
+    <PackageReference Include="System.Text.Json" Version="8.0.5" />
+  </ItemGroup>
+</Project>

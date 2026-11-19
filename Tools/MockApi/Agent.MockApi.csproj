@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Development/testing tool only. Never deployed to endpoints. Needs the .NET 8 SDK on a developer machine. -->
+  <PropertyGroup>
+    <TargetFrameworks>net8.0</TargetFrameworks>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Agent.MockApi</RootNamespace>
+    <AssemblyName>Agent.MockApi</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <ProjectReference Include="..\..\Agent.Models\Agent.Models.csproj" />
+  </ItemGroup>
+</Project>

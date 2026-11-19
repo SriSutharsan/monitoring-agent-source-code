@@ -1,0 +1,29 @@
+<Project>
+  <!--
+    Shared build settings.
+    Every project multi-targets:
+      net48 -> Windows 7 SP1 / 8.1 / 10 / 11 (needs .NET Framework 4.8 installed; built into Win10 1903+ / Win11)
+      net8.0 -> Windows 10 1607+ / 11, published self-contained for win-x64 (no runtime needed on the laptop)
+    .NET 8 itself does NOT run on Windows 7, hence the net48 target for legacy machines.
+    (Plain net8.0 rather than net8.0-windows: the agent only uses Windows APIs through packages, and this avoids the WindowsDesktop pack.)
+  -->
+  <PropertyGroup>
+    <TargetFrameworks>net48;net8.0</TargetFrameworks>
+    <LangVersion>11.0</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <Deterministic>true</Deterministic>
+    <Version>1.0.0</Version>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <FileVersion>1.0.0.0</FileVersion>
+    <Company>Endpoint Agent</Company>
+    <Product>Windows Endpoint Monitoring Agent</Product>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <NoWarn>$(NoWarn);CA1416;CS1591;NU1701</NoWarn>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(TargetFramework)' == 'net48'">
+    <DefineConstants>$(DefineConstants);NETFX</DefineConstants>
+  </PropertyGroup>
+</Project>
