@@ -1,9 +1,0 @@
-<Project>
-  <!-- Isolated from the solution-level props on purpose: the harness is plain net8.0 and must restore offline. -->
-  <PropertyGroup>
-    <LangVersion>11.0</LangVersion>
-    <Nullable>disable</Nullable>
-    <ImplicitUsings>disable</ImplicitUsings>
-    <NoWarn>$(NoWarn);CA1416;CS1591;NU1701</NoWarn>
-  </PropertyGroup>
-</Project>
