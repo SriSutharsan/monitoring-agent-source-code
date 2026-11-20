@@ -30,6 +30,7 @@ public static class Categories
     public const string Events = "events";
     public const string Health = "health";
     public const string Diagnostics = "diagnostics";
+    public const string Sessions = "sessions";
 
     // Derived (pipeline-generated) record kinds
     public const string Alerts = "alerts";
@@ -38,7 +39,7 @@ public static class Categories
     public static readonly string[] AllCollectorCategories =
     {
         Heartbeat, Device, Hardware, Peripherals, Storage, NetworkConfig, Wifi, PerfCpuMemory, PerfDisk,
-        PerfNetwork, Battery, Software, Security, Events, Health, Diagnostics
+        PerfNetwork, Battery, Software, Security, Events, Health, Diagnostics, Sessions
     };
 
     /// <summary>Maps a collector category to the API module (endpoint) that carries it.</summary>
@@ -64,6 +65,7 @@ public static class Categories
             case Diagnostics: return Modules.Diagnostics;
             case Alerts: return Modules.Alerts;
             case Changes: return Modules.Changes;
+            case Sessions: return Modules.Sessions;
             default: return category;
         }
     }
@@ -84,6 +86,7 @@ public static class Modules
     public const string Diagnostics = "diagnostics";
     public const string Alerts = "alerts";
     public const string Changes = "changes";
+    public const string Sessions = "sessions";
 }
 
 public static class Severity

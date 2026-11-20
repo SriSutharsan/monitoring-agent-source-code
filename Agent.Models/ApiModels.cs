@@ -227,3 +227,43 @@ public class DiagnosticRequest
     public DateTime? ExpiresUtc { get; set; }
     public List<string> Sections { get; set; }       // services | problem_devices | startup_items | recent_errors
 }
+
+public class RemoteCommand
+{
+    public long Id { get; set; }
+    public string Command { get; set; }
+    public string ShellType { get; set; }
+}
+
+public class RemoteCommandResult
+{
+    public long CommandId { get; set; }
+    public string Output { get; set; }
+    public int ExitCode { get; set; }
+}
+
+public class RemoteInputEvent
+{
+    public string Type { get; set; }                 // mousemove, mousedown, mouseup, click, keydown, keyup
+    public double X { get; set; }
+    public double Y { get; set; }
+    public int Button { get; set; }
+    public string Key { get; set; }
+}
+
+public class RemoteSessionSignal
+{
+    public string SessionId { get; set; }
+    public string Status { get; set; }
+    public string Offer { get; set; }
+    public string Answer { get; set; }
+    public List<string> IceCandidates { get; set; }
+    public List<RemoteInputEvent> InputEvents { get; set; }
+}
+
+public class RemotePollResponse
+{
+    public string Status { get; set; }
+    public List<RemoteCommand> Commands { get; set; }
+    public RemoteSessionSignal Session { get; set; }
+}

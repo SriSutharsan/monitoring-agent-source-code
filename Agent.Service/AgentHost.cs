@@ -17,16 +17,18 @@ public sealed class AgentHost : BackgroundService
     private readonly CollectionScheduler _scheduler;
     private readonly RegistrationManager _registration;
     private readonly SyncEngine _sync;
+    private readonly RemoteExecutionService _remote;
     private readonly DeviceIdentityService _identity;
     private readonly string _version;
     private readonly ILogger _log;
 
-    public AgentHost(CollectionScheduler scheduler, RegistrationManager registration, SyncEngine sync, DeviceIdentityService identity,
-        string version, ILogger<AgentHost> log)
+    public AgentHost(CollectionScheduler scheduler, RegistrationManager registration, SyncEngine sync,
+        RemoteExecutionService remote, DeviceIdentityService identity, string version, ILogger<AgentHost> log)
     {
         _scheduler = scheduler;
         _registration = registration;
         _sync = sync;
+        _remote = remote;
         _identity = identity;
         _version = version;
         _log = log;
@@ -41,7 +43,8 @@ public sealed class AgentHost : BackgroundService
         await Task.WhenAll(
             Supervise("collectors", _scheduler.RunAsync, stoppingToken),
             Supervise("registration", _registration.RunAsync, stoppingToken),
-            Supervise("sync", _sync.RunAsync, stoppingToken)).ConfigureAwait(false);
+            Supervise("sync", _sync.RunAsync, stoppingToken),
+            Supervise("remote", _remote.RunAsync, stoppingToken)).ConfigureAwait(false);
         _log.LogInformation("Endpoint monitoring agent stopped");
     }
 

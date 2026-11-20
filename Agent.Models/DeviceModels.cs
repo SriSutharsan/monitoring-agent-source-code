@@ -70,3 +70,14 @@ public class Heartbeat
     public long? AgentWorkingSetBytes { get; set; }
     public List<CollectorStatus> Collectors { get; set; }
 }
+
+public class UserSessionEvent
+{
+    public string EventType { get; set; }        // logon, logoff, lock, unlock, sleep, wake
+    public string Username { get; set; }
+    public string Domain { get; set; }
+    public int SessionId { get; set; }
+    public string LogonType { get; set; }        // Interactive, RemoteDesktop, Unlock, Console
+    public DateTime OccurredAtUtc { get; set; }
+    public Dictionary<string, string> Metadata { get; set; }
+}

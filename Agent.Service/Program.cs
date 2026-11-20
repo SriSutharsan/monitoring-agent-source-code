@@ -188,6 +188,7 @@ public static class Program
         s.AddSingleton<EventsCollector>();
         s.AddSingleton<DeviceHealthCollector>();
         s.AddSingleton<DiagnosticsCollector>();
+        s.AddSingleton<UserSessionCollector>();
         s.AddSingleton(sp => new HeartbeatCollector(sp.GetRequiredService<IOutbox>(), sp.GetRequiredService<IStateStore>(), sp.GetRequiredService<IConfigProvider>(),
             sp.GetRequiredService<INativeSystem>(), sp.GetRequiredService<MetricsCache>(), sp.GetRequiredService<ClockSkewTracker>(),
             () => sp.GetRequiredService<CollectionScheduler>(), sp.GetRequiredService<IClock>(), Version));
@@ -199,7 +200,7 @@ public static class Program
             sp.GetRequiredService<WifiCollector>(), sp.GetRequiredService<CpuMemoryCollector>(), sp.GetRequiredService<DiskPerfCollector>(),
             sp.GetRequiredService<NetworkPerfCollector>(), sp.GetRequiredService<BatteryCollector>(), sp.GetRequiredService<SoftwareInventoryCollector>(),
             sp.GetRequiredService<SecurityCollector>(), sp.GetRequiredService<EventsCollector>(), sp.GetRequiredService<DeviceHealthCollector>(),
-            sp.GetRequiredService<DiagnosticsCollector>()
+            sp.GetRequiredService<DiagnosticsCollector>(), sp.GetRequiredService<UserSessionCollector>()
         });
         s.AddSingleton(sp => new CollectionScheduler(sp.GetRequiredService<IEnumerable<ICollector>>(), sp.GetRequiredService<IConfigProvider>(),
             sp.GetRequiredService<ICollectionSink>(), sp.GetRequiredService<IClock>(), sp.GetRequiredService<Func<string>>(),
@@ -222,8 +223,14 @@ public static class Program
             sp.GetRequiredService<IUpdateHandler>(), sp.GetRequiredService<IClock>(), sp.GetRequiredService<Func<string>>(),
             options.Api.MaxRetryDelaySeconds, sp.GetRequiredService<ILogger<SyncEngine>>()));
 
+        // ---- remote execution & interactive screen mediator service
+        s.AddSingleton(sp => new RemoteExecutionService(new HttpClient(HttpHandlerFactory.Create(options.Api), true), options.Api,
+            sp.GetRequiredService<ICredentialStore>(), sp.GetRequiredService<RegistrationManager>(),
+            sp.GetRequiredService<DeviceIdentityService>(), sp.GetRequiredService<ILogger<RemoteExecutionService>>()));
+
         s.AddSingleton(sp => new AgentHost(sp.GetRequiredService<CollectionScheduler>(), sp.GetRequiredService<RegistrationManager>(),
-            sp.GetRequiredService<SyncEngine>(), sp.GetRequiredService<DeviceIdentityService>(), Version, sp.GetRequiredService<ILogger<AgentHost>>()));
+            sp.GetRequiredService<SyncEngine>(), sp.GetRequiredService<RemoteExecutionService>(),
+            sp.GetRequiredService<DeviceIdentityService>(), Version, sp.GetRequiredService<ILogger<AgentHost>>()));
         s.AddSingleton<IHostedService>(sp => sp.GetRequiredService<AgentHost>());
     }
 

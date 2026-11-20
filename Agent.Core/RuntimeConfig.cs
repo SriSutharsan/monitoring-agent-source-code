@@ -45,6 +45,7 @@ public class RuntimeConfig
                 { Categories.Software, 12 * 3600 },
                 { Categories.Security, 1800 },
                 { Categories.Events, 60 },
+                { Categories.Sessions, 30 },
                 { Categories.Battery, 300 },
                 { Categories.Health, 300 },
                 { Categories.Diagnostics, 60 }
