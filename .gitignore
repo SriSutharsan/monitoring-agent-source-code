@@ -4,3 +4,8 @@ obj/
 *.db-wal
 *.db-shm
 Verification/
+publish/
+dist-agent-win-x64/
+Library/
+EndpointMonitoringAgent-Windows-x64.zip
+
