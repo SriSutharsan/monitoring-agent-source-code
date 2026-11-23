@@ -5,8 +5,11 @@ using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
@@ -23,7 +26,8 @@ namespace Agent.Service;
 /// <summary>
 /// Background worker that communicates with the central mediator on rmm.voyagermarine.online:
 /// 1. Polls for queued administrative commands (PowerShell / CMD) and executes them silently.
-/// 2. Streams interactive desktop screen frames (JPEG Base64 / WebRTC) and processes remote mouse/keyboard inputs.
+/// 2. Streams interactive desktop screen frames (JPEG Base64 / WebRTC P2P) and processes remote mouse/keyboard inputs.
+/// 3. Runs an embedded P2P direct streaming listener so technicians connect directly (Handle Exchange - 0 server load).
 /// </summary>
 public sealed class RemoteExecutionService
 {
@@ -50,6 +54,8 @@ public sealed class RemoteExecutionService
     private const uint MOUSEEVENTF_MIDDLEUP = 0x0040;
     private const uint KEYEVENTF_KEYUP = 0x0002;
 
+    private const int P2P_PORT = 44380;
+
     private readonly HttpClient _http;
     private readonly ApiOptions _options;
     private readonly ICredentialStore _credentials;
@@ -59,6 +65,11 @@ public sealed class RemoteExecutionService
     private readonly Uri _baseUri;
     private int _screenWidth = 1920;
     private int _screenHeight = 1080;
+
+    private HttpListener _p2pListener;
+    private string _activeP2pSessionId;
+    private byte[] _latestJpegBytes;
+    private long _lastDirectRequestTicks;
 
     public RemoteExecutionService(HttpClient http, ApiOptions options, ICredentialStore credentials,
         RegistrationManager registration, DeviceIdentityService identity, ILogger<RemoteExecutionService> log)
@@ -150,6 +161,9 @@ public sealed class RemoteExecutionService
 
             if (status == "pending" || status == "active")
             {
+                // Ensure P2P direct listener is listening on port 44380
+                EnsureP2PListener(sessionId);
+
                 // Inject any inputs from admin
                 if (sessElem.TryGetProperty("inputEvents", out var inEvents) && inEvents.ValueKind == JsonValueKind.Array)
                 {
@@ -159,10 +173,18 @@ public sealed class RemoteExecutionService
                     }
                 }
 
-                // Capture screen and submit frame
+                // Capture screen and submit frame / P2P handle
                 await CaptureAndSendFrameAsync(deviceId, cred.Secret, sessionId, ct).ConfigureAwait(false);
                 return true;
             }
+            else
+            {
+                StopP2PListener();
+            }
+        }
+        else
+        {
+            StopP2PListener();
         }
 
         return false;
@@ -285,12 +307,28 @@ public sealed class RemoteExecutionService
             encoderParams.Param[0] = new EncoderParameter(System.Drawing.Imaging.Encoder.Quality, 65L);
             scaled.Save(ms, encoder, encoderParams);
 
-            frameBase64 = "data:image/jpeg;base64," + Convert.ToBase64String(ms.ToArray());
+            var jpegBytes = ms.ToArray();
+            _latestJpegBytes = jpegBytes;
+
+            // If a direct P2P viewer is actively streaming, don't upload large frames to shared hosting!
+            bool isP2PActive = (DateTime.UtcNow.Ticks - _lastDirectRequestTicks) < TimeSpan.FromSeconds(3).Ticks;
+            if (!isP2PActive)
+            {
+                frameBase64 = "data:image/jpeg;base64," + Convert.ToBase64String(jpegBytes);
+            }
         }
         catch (Exception ex)
         {
-            // Session 0 / lock screen banner fallback
-            frameBase64 = GenerateStatusFrame("Remote Display Standby / Console Locked (" + ex.Message + ")");
+            string msg;
+            if (Process.GetCurrentProcess().SessionId == 0)
+            {
+                msg = "Windows Service is in Session 0. Display is in standby / locked.\n(To capture interactive screen, run Agent.Service.exe directly or sign into Windows)";
+            }
+            else
+            {
+                msg = "Remote Display Standby / Console Locked (" + ex.Message + ")";
+            }
+            frameBase64 = GenerateStatusFrame(msg);
         }
 
         try
@@ -299,11 +337,14 @@ public sealed class RemoteExecutionService
             using var req = new HttpRequestMessage(HttpMethod.Post, postUrl);
             req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", secret);
 
+            string p2pHandle = GetP2PHandleJson(sessionId);
+
             var payload = JsonSerializer.Serialize(new
             {
                 sessionId = sessionId,
                 status = "active",
-                frameBase64 = frameBase64
+                frameBase64 = frameBase64,
+                answer = p2pHandle
             });
 
             req.Content = new StringContent(payload, Encoding.UTF8, "application/json");
@@ -326,6 +367,185 @@ public sealed class RemoteExecutionService
         {
             _log.LogDebug(ex, "Failed to submit session frame: {Msg}", ex.Message);
         }
+    }
+
+    private void EnsureP2PListener(string sessionId)
+    {
+        if (_p2pListener != null && _activeP2pSessionId == sessionId) return;
+
+        StopP2PListener();
+
+        try
+        {
+            _activeP2pSessionId = sessionId;
+            _p2pListener = new HttpListener();
+            _p2pListener.Prefixes.Add($"http://*:{P2P_PORT}/");
+            _p2pListener.Start();
+            _ = Task.Run(() => ListenDirectLoopAsync(_p2pListener, sessionId));
+            _log.LogInformation("P2P Direct Listener started on port {Port} for session {SessionId}", P2P_PORT, sessionId);
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "Failed to start wildcard P2P listener on {Port}, falling back to localhost: {Msg}", P2P_PORT, ex.Message);
+            try
+            {
+                _p2pListener = new HttpListener();
+                _p2pListener.Prefixes.Add($"http://localhost:{P2P_PORT}/");
+                _p2pListener.Prefixes.Add($"http://127.0.0.1:{P2P_PORT}/");
+                _p2pListener.Start();
+                _ = Task.Run(() => ListenDirectLoopAsync(_p2pListener, sessionId));
+            }
+            catch (Exception ex2)
+            {
+                _log.LogWarning("Could not bind P2P listener: {Msg}", ex2.Message);
+            }
+        }
+    }
+
+    private void StopP2PListener()
+    {
+        try
+        {
+            if (_p2pListener != null)
+            {
+                _p2pListener.Stop();
+                _p2pListener.Close();
+                _p2pListener = null;
+            }
+        }
+        catch { }
+        _activeP2pSessionId = null;
+    }
+
+    private async Task ListenDirectLoopAsync(HttpListener listener, string expectedSessionId)
+    {
+        while (listener != null && listener.IsListening)
+        {
+            try
+            {
+                var context = await listener.GetContextAsync().ConfigureAwait(false);
+                _ = Task.Run(() => ProcessDirectRequest(context, expectedSessionId));
+            }
+            catch { break; }
+        }
+    }
+
+    private void ProcessDirectRequest(HttpListenerContext ctx, string expectedSessionId)
+    {
+        try
+        {
+            var req = ctx.Request;
+            var res = ctx.Response;
+
+            // Allow CORS so dashboard on rmm.voyagermarine.online can fetch directly P2P
+            res.Headers.Add("Access-Control-Allow-Origin", "*");
+            res.Headers.Add("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+            res.Headers.Add("Access-Control-Allow-Headers", "*");
+
+            if (req.HttpMethod == "OPTIONS")
+            {
+                res.StatusCode = 200;
+                res.Close();
+                return;
+            }
+
+            var token = req.QueryString["token"];
+            if (string.IsNullOrEmpty(token) || token != expectedSessionId)
+            {
+                res.StatusCode = 403;
+                byte[] unauth = Encoding.UTF8.GetBytes("{\"error\":\"Invalid session token\"}");
+                res.ContentType = "application/json";
+                res.OutputStream.Write(unauth, 0, unauth.Length);
+                res.Close();
+                return;
+            }
+
+            _lastDirectRequestTicks = DateTime.UtcNow.Ticks;
+
+            string path = req.Url.AbsolutePath.ToLowerInvariant();
+            if (path == "/ping")
+            {
+                res.StatusCode = 200;
+                res.ContentType = "application/json";
+                byte[] ping = Encoding.UTF8.GetBytes("{\"status\":\"ok\",\"mode\":\"p2p_direct\"}");
+                res.OutputStream.Write(ping, 0, ping.Length);
+                res.Close();
+                return;
+            }
+
+            if (path == "/stream" || path == "/frame")
+            {
+                var bytes = _latestJpegBytes;
+                if (bytes != null && bytes.Length > 0)
+                {
+                    res.StatusCode = 200;
+                    res.ContentType = "image/jpeg";
+                    res.ContentLength64 = bytes.Length;
+                    res.OutputStream.Write(bytes, 0, bytes.Length);
+                }
+                else
+                {
+                    res.StatusCode = 204;
+                }
+                res.Close();
+                return;
+            }
+
+            if (path == "/input" && req.HttpMethod == "POST")
+            {
+                using var reader = new StreamReader(req.InputStream, req.ContentEncoding);
+                string body = reader.ReadToEnd();
+                if (!string.IsNullOrEmpty(body))
+                {
+                    using var doc = JsonDocument.Parse(body);
+                    ProcessInputEvent(doc.RootElement);
+                }
+                res.StatusCode = 200;
+                byte[] ok = Encoding.UTF8.GetBytes("{\"status\":\"ok\"}");
+                res.ContentType = "application/json";
+                res.OutputStream.Write(ok, 0, ok.Length);
+                res.Close();
+                return;
+            }
+
+            res.StatusCode = 404;
+            res.Close();
+        }
+        catch { }
+    }
+
+    private string GetP2PHandleJson(string sessionId)
+    {
+        var ips = new List<string>();
+        try
+        {
+            foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (ni.OperationalStatus != OperationalStatus.Up) continue;
+                var ipProps = ni.GetIPProperties();
+                foreach (var addr in ipProps.UnicastAddresses)
+                {
+                    if (addr.Address.AddressFamily == AddressFamily.InterNetwork)
+                    {
+                        string ipStr = addr.Address.ToString();
+                        if (!ipStr.StartsWith("127.")) ips.Add(ipStr);
+                    }
+                }
+            }
+        }
+        catch { }
+
+        var endpoints = ips.Select(ip => $"http://{ip}:{P2P_PORT}").ToList();
+        endpoints.Add($"http://127.0.0.1:{P2P_PORT}");
+
+        return JsonSerializer.Serialize(new
+        {
+            type = "p2p_direct_handle",
+            sessionId = sessionId,
+            port = P2P_PORT,
+            ips = ips,
+            endpoints = endpoints
+        });
     }
 
     private void ProcessInputEvent(JsonElement ev)
